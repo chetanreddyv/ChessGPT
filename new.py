@@ -4,10 +4,11 @@ import pandas as pd
 import torch
 from transformers import GPT2Tokenizer, GPT2LMHeadModel, Trainer, TrainingArguments, DataCollatorForLanguageModeling
 from datasets import load_dataset
+from peft import get_peft_model, LoraConfig, TaskType
 
 # Load the dataset
 final_df = pd.read_csv('final_chess_games.csv')
-final_df = final_df[['Result', 'AN']]
+final_df = final_df[['Result', 'AN']].head(5000)  # Select first 5000 rows
 
 # Prepare the text data
 print("Preprocessing data...")
@@ -25,12 +26,32 @@ tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
 model = GPT2LMHeadModel.from_pretrained('gpt2')
 model.resize_token_embeddings(len(tokenizer))
 
+# Apply LoRA for parameter-efficient fine-tuning using PEFT
+lora_config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    inference_mode=False,
+    r=4,                # Rank of the low-rank decomposition
+    lora_alpha=32,      # Scaling factor
+    lora_dropout=0.1,   # Dropout rate
+    target_modules=["attn.c_proj"],  # Target layers for adaptation
+)
+
+model = get_peft_model(model, lora_config)
+
+# Freeze all model parameters except LoRA parameters
+for param in model.parameters():
+    param.requires_grad = False
+
+for name, param in model.named_parameters():
+    if "lora" in name:
+        param.requires_grad = True
+
 # Prepare dataset
 print("Loading dataset...")
 datasets = load_dataset('text', data_files={'train': 'chess_moves.txt'})
 
 def tokenize_function(example):
-    return tokenizer(example['text'], truncation=True, max_length=128)
+    return tokenizer(example['text'], truncation=True, max_length=128, padding='max_length')
 
 tokenized_datasets = datasets.map(tokenize_function, batched=True, remove_columns=["text"])
 
@@ -41,46 +62,33 @@ data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 training_args = TrainingArguments(
     output_dir='./results',
     overwrite_output_dir=True,
-    num_train_epochs=3,
-    per_device_train_batch_size=8,
-    save_steps=10_000,
+    evaluation_strategy='steps',
+    eval_steps=500,
+    logging_dir='./logs',
+    logging_steps=100,
+    save_steps=1000,
     save_total_limit=2,
+    learning_rate=5e-5,
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=16,
+    num_train_epochs=3,
+    warmup_steps=500,
+    weight_decay=0.01,
+    fp16=True,  # Use mixed precision for memory efficiency
+    optim='adamw_torch',
 )
 
-# Initialize Trainer
+# Trainer
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=tokenized_datasets['train'],
+    tokenizer=tokenizer,
     data_collator=data_collator,
 )
 
-# Training
-print("Starting training...")
+# Train the model
 trainer.train()
-print("Training completed.")
 
-# Save the final model
-trainer.save_model('./chess_gpt_model')
-tokenizer.save_pretrained('./chess_gpt_model')
-
-# Generate moves
-print("Generating moves...")
-model.eval()
-
-def generate_moves(model, tokenizer, prompt, max_length=50):
-    input_ids = tokenizer.encode(prompt, return_tensors='pt')
-    sample_outputs = model.generate(
-        input_ids=input_ids,
-        max_length=max_length,
-        num_beams=5,
-        no_repeat_ngram_size=2,
-        early_stopping=True
-    )
-    generated_text = tokenizer.decode(sample_outputs[0], skip_special_tokens=True)
-    return generated_text
-
-# Example usage
-start_sequence = '1. e4 e5 2. Nf3 Nc6'
-generated_moves = generate_moves(model, tokenizer, start_sequence)
-print("Generated moves:", generated_moves)
+# Save the fine-tuned model
+trainer.save_model('./lora_finetuned_gpt')
