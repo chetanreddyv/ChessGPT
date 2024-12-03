@@ -9,21 +9,23 @@ from torch.utils.data import Dataset
 from accelerate import Accelerator
 
 # Dataset Preparation - Parse Chess Game Moves as Sequences
-def parse_chess_games(file_path, limit=50000):
+def parse_chess_games(file_path, limit=5000):
     data = []
     with open(file_path, "r") as file:
         lines = file.readlines()
-    for count, line in enumerate(lines):
+    count = 0
+    for line in lines:
         if "###" in line:
             if count >= limit:
                 break
-
             # Extract Elo ratings from the metadata
-            metadata = line.split("###")[0].strip()
+            parts = line.split("###")
+            metadata = parts[0].strip()
+            raw_moves = parts[1].strip()
             try:
-                welo, belo = metadata.split()[3:5]
-                welo = int(welo) if welo != "None" else 0
-                belo = int(belo) if belo != "None" else 0
+                meta_parts = metadata.split()
+                welo = int(meta_parts[3]) if meta_parts[3] != "None" else 0
+                belo = int(meta_parts[4]) if meta_parts[4] != "None" else 0
             except (IndexError, ValueError):
                 continue
 
@@ -32,14 +34,14 @@ def parse_chess_games(file_path, limit=50000):
                 continue
 
             # Extract moves
-            raw_moves = line.split("###")[1].strip()
-            moves = re.findall(r"\.\s*([^\s]+)", raw_moves)
+            moves = re.findall(r"\.\s*([^\.]+)", raw_moves)
             if not moves:
                 continue
 
             game_sequence = " ".join(moves).strip()
             if game_sequence:
                 data.append(game_sequence)
+                count += 1
 
     return pd.DataFrame(data, columns=["text"])
 
@@ -69,46 +71,32 @@ class ChessDataset(Dataset):
 # Function to Check Move Legality
 def is_legal_move(board, move):
     try:
-        board.push_san(move)
-        board.pop()
+        move_obj = board.parse_san(move)
         return True
     except ValueError:
         return False
 
 class CustomTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None): # Include num_items_in_batch argument
-        # Get model outputs
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         outputs = model(**inputs)
-        logits = outputs.logits  # Shape: (batch_size, seq_len, vocab_size)
-        labels = inputs["labels"]  # Shape: (batch_size, seq_len)
+        logits = outputs.logits
+        labels = inputs["labels"]
 
         # Shift logits and labels for causal language modeling
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
 
         # Calculate loss
-        loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        loss_fct = torch.nn.CrossEntropyLoss()
+        loss = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1)
+        )
 
-        # Penalize illegal moves
-        batch_size, seq_len = shift_labels.shape
-        board = chess.Board()
-        for i in range(batch_size):
-            move_sequence = []
-            for j in range(seq_len):
-                token = shift_labels[i, j].item()
-                if token == -100:  # Skip padding
-                    continue
-                move = tokenizer.decode([token]).strip()
-                if not is_legal_move(board, move):
-                    loss[i * seq_len + j] *= 2  # Increase penalty for illegal moves
-                else:
-                    board.push_san(move)  # Apply the move to the board
-
-        return (loss.mean(), outputs) if return_outputs else loss.mean()
+        return (loss, outputs) if return_outputs else loss
 
 # Data Preparation
-file_path = "/content/all_with_filtered_anotations_since1998 copy.txt"
+file_path = "/content/all_with_filtered_anotations_since1998 copy.txt"  # Update with your actual data file path
 raw_data = parse_chess_games(file_path)
 train_data = raw_data.sample(frac=0.8, random_state=42)
 val_data = raw_data.drop(train_data.index)
@@ -137,13 +125,14 @@ accelerator = Accelerator()
 # Training Arguments
 training_args = TrainingArguments(
     output_dir="./results",
-    evaluation_strategy="epoch",
+    eval_strategy="epoch",
     per_device_train_batch_size=8,
     per_device_eval_batch_size=8,
     num_train_epochs=4,
     learning_rate=5e-5,
     weight_decay=0.01,
     logging_dir="./logs",
+    logging_steps=100,
     save_strategy="epoch",
     save_total_limit=2,
     fp16=True,
@@ -155,7 +144,6 @@ trainer = CustomTrainer(
     args=training_args,
     train_dataset=train_dataset,
     eval_dataset=val_dataset,
-    tokenizer=tokenizer,
 )
 
 # Fine-Tuning
@@ -165,34 +153,79 @@ trainer.train()
 model.save_pretrained("./fine_tuned_model")
 tokenizer.save_pretrained("./fine_tuned_model")
 
-# Inference Pipeline
-def predict_next_move(model, tokenizer, board, move_history, color):
+def predict_next_move(model, tokenizer, board, move_history):
+    device = next(model.parameters()).device
+
+    # Create context with move history
     input_text = " ".join(move_history)
-    inputs = tokenizer(input_text, return_tensors="pt").input_ids
-    outputs = model.generate(inputs, max_length=len(inputs[0]) + 1, pad_token_id=tokenizer.eos_token_id)
-    predicted_move = tokenizer.decode(outputs[0][-1], skip_special_tokens=True)
-    if is_legal_move(board, predicted_move):
-        return predicted_move
-    return "Illegal Move"
+    inputs = tokenizer(input_text, return_tensors="pt").to(device)
+
+    # Generate multiple candidates and take first legal one
+    outputs = model.generate(
+        inputs.input_ids,
+        max_length=inputs.input_ids.shape[1] + 5,  # Allow some tokens for the move
+        num_return_sequences=5,
+        pad_token_id=tokenizer.eos_token_id,
+        do_sample=True,
+        temperature=0.7
+    )
+
+    # Try each predicted move until finding a legal one
+    for output in outputs:
+        predicted_tokens = output[inputs.input_ids.shape[1]:]
+        predicted_move = tokenizer.decode(predicted_tokens, skip_special_tokens=True).strip().split()[0]
+        if is_legal_move(board, predicted_move):
+            return predicted_move
+
+    return "resign"
 
 # Test the System
-board = chess.Board()
-move_history = []
-color = "White"
+def play_game():
+    board = chess.Board()
+    move_history = []
+    move_counter = 0
+    max_moves = 100  # Prevent infinite loops
+    
+    # Load the fine-tuned model
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = AutoModelForCausalLM.from_pretrained("./fine_tuned_model").to(device)
+    tokenizer = AutoTokenizer.from_pretrained("./fine_tuned_model")
 
-while not board.is_game_over():
-    print(board)
-    if board.turn == chess.WHITE and color == "White" or board.turn == chess.BLACK and color == "Black":
-        move = predict_next_move(model, tokenizer, board, move_history, color)
-        print(f"Predicted Move: {move}")
-        if move != "Illegal Move":
-            board.push_san(move)
-            move_history.append(move)
+    while not board.is_game_over() and move_counter < max_moves:
+        print(board)
+        print(f"\nMove {move_counter + 1}")
+
+        if board.turn == chess.WHITE:
+            move = predict_next_move(model, tokenizer, board, move_history)
+            print(f"Predicted Move: {move}")
+
+            if move != "resign":
+                try:
+                    board.push_san(move)
+                    move_history.append(move)
+                    move_counter += 1
+                except ValueError:
+                    print("Invalid move predicted by the model, resigning...")
+                    break
+            else:
+                print("Model resigns.")
+                break
         else:
-            print("Illegal move predicted, skipping...")
-    else:
-        opponent_move = input("Opponent's move: ")
-        board.push_san(opponent_move)
-        move_history.append(opponent_move)
+            while True:
+                try:
+                    opponent_move = input("Opponent's move (or 'quit' to end): ")
+                    if opponent_move.lower() == 'quit':
+                        return
+                    board.push_san(opponent_move)
+                    move_history.append(opponent_move)
+                    move_counter += 1
+                    break
+                except ValueError:
+                    print("Invalid move, try again...")
 
-print("Game Over")
+    print("\nGame Over")
+    print(f"Final position:\n{board}")
+    print(f"Game history: {' '.join(move_history)}")
+
+if __name__ == "__main__":
+    play_game()
